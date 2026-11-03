@@ -1,3 +1,4 @@
+import json
 import time
 from uuid import uuid4
 
@@ -904,3 +905,64 @@ def test_initialize_from_storage_keeps_session_on_network_error() -> None:
     finally:
         if client._refresh_token_timer:
             client._refresh_token_timer.cancel()
+
+
+def test_initialize_from_storage_keeps_session_without_auto_refresh() -> None:
+    # With auto refresh off, startup must not refresh an expired stored session
+    # or delete it: get_session() can still refresh it on demand.
+    from httpx import Client, MockTransport, Request, Response
+    from supabase_auth import SyncGoTrueClient
+    from supabase_auth.types import Session, User
+
+    user = {
+        "id": str(uuid4()),
+        "aud": "authenticated",
+        "app_metadata": {},
+        "user_metadata": {},
+        "created_at": "2024-01-01T00:00:00Z",
+    }
+    refresh_tokens = []
+
+    def handler(request: Request) -> Response:
+        assert request.url.path == "/token"
+        assert request.url.params["grant_type"] == "refresh_token"
+        refresh_tokens.append(json.loads(request.content)["refresh_token"])
+        return Response(
+            200,
+            json={
+                "access_token": "new-access-token",
+                "refresh_token": "new-refresh-token",
+                "token_type": "bearer",
+                "expires_in": 3600,
+                "expires_at": round(time.time()) + 3600,
+                "user": user,
+            },
+        )
+
+    client = SyncGoTrueClient(
+        url="http://auth.test",
+        auto_refresh_token=False,
+        http_client=Client(transport=MockTransport(handler)),
+    )
+    expired_session = Session(
+        access_token="expired-access-token",
+        refresh_token="old-refresh-token",
+        token_type="bearer",
+        expires_in=3600,
+        expires_at=round(time.time()) - 60,
+        user=User.model_validate(user),
+    )
+    client._storage.set_item(client._storage_key, expired_session.model_dump_json())
+
+    client.initialize_from_storage()
+
+    assert refresh_tokens == []
+    stored = client._storage.get_item(client._storage_key)
+    assert stored is not None
+    assert Session.model_validate_json(stored).access_token == "expired-access-token"
+
+    session = client.get_session()
+
+    assert refresh_tokens == ["old-refresh-token"]
+    assert session is not None
+    assert session.access_token == "new-access-token"
